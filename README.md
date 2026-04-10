@@ -38,12 +38,15 @@ port-explorer
 | Key | Action |
 |---|---|
 | `↑/↓` or `j/k` | Navigate |
-| `Enter` or `→` | View port details |
-| `Esc` or `←` | Go back |
+| `Enter` or `→` | View port details / expand group |
+| `Esc` or `←` | Go back / collapse |
 | `/` | Search / filter |
+| `g` | Toggle group by process |
 | `d` | Kill process on selected port |
 | `r` | Refresh |
 | `q` | Quit |
+
+**Group mode** (`g`): Ports are grouped by process so you can see at a glance how many connections each process has. Expand a group with `Enter` to see individual ports.
 
 ### Non-interactive mode
 
