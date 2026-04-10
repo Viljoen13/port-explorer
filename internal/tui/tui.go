@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -42,6 +43,9 @@ var (
 	filterInputStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
 
 	confirmStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
+
+	groupHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
+	groupCountStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
 
 type view int
@@ -51,9 +55,28 @@ const (
 	viewDetail
 )
 
+// A row in the grouped view: either a group header or a port entry
+type listRow struct {
+	isGroup  bool
+	group    *processGroup
+	entry    ports.PortInfo
+	expanded bool // only meaningful for group headers
+}
+
+type processGroup struct {
+	name      string
+	pid       int
+	entries   []ports.PortInfo
+	expanded  bool
+	listening int
+	established int
+	other     int
+}
+
 type Model struct {
-	entries    []ports.PortInfo
+	entries   []ports.PortInfo
 	filtered  []ports.PortInfo
+	rows      []listRow // flattened rows for display (used in grouped mode)
 	cursor    int
 	offset    int
 	height    int
@@ -61,6 +84,8 @@ type Model struct {
 	view      view
 	filter    string
 	filtering bool
+	grouped   bool
+	groups    []*processGroup
 	message   string
 	confirm   bool
 	err       error
@@ -103,16 +128,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		// Handle confirm dialog
 		if m.confirm {
 			return m.handleConfirm(msg)
 		}
-
-		// Handle filter input
 		if m.filtering {
 			return m.handleFilterInput(msg)
 		}
-
 		return m.handleNormal(msg)
 	}
 
@@ -123,17 +144,15 @@ func (m Model) handleConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "y", "Y":
 		m.confirm = false
-		if m.cursor < len(m.filtered) {
-			entry := m.filtered[m.cursor]
-			if entry.PID > 0 {
-				err := syscall.Kill(entry.PID, syscall.SIGTERM)
-				if err != nil {
-					m.message = errorStyle.Render(fmt.Sprintf("Failed to kill PID %d: %v", entry.PID, err))
-				} else {
-					m.message = successStyle.Render(fmt.Sprintf("Sent SIGTERM to %s (PID %d)", entry.Process, entry.PID))
-				}
-				return m, refresh
+		pid, process := m.selectedPidProcess()
+		if pid > 0 {
+			err := syscall.Kill(pid, syscall.SIGTERM)
+			if err != nil {
+				m.message = errorStyle.Render(fmt.Sprintf("Failed to kill PID %d: %v", pid, err))
+			} else {
+				m.message = successStyle.Render(fmt.Sprintf("Sent SIGTERM to %s (PID %d)", process, pid))
 			}
+			return m, refresh
 		}
 	case "n", "N", "esc", "escape":
 		m.confirm = false
@@ -177,15 +196,26 @@ func (m Model) handleNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "down", "j":
-		if m.view == viewList && m.cursor < len(m.filtered)-1 {
+		maxIdx := m.maxIndex()
+		if m.view == viewList && m.cursor < maxIdx {
 			m.cursor++
 			m.message = ""
 		}
 
 	case "enter", "right", "l":
-		if m.view == viewList && len(m.filtered) > 0 {
-			m.view = viewDetail
-			m.message = ""
+		if m.view == viewList {
+			if m.grouped {
+				// Toggle expand/collapse on group headers
+				if m.cursor < len(m.rows) && m.rows[m.cursor].isGroup {
+					m.rows[m.cursor].group.expanded = !m.rows[m.cursor].group.expanded
+					m.rebuildRows()
+				} else if m.cursor < len(m.rows) && !m.rows[m.cursor].isGroup {
+					m.view = viewDetail
+				}
+			} else if len(m.filtered) > 0 {
+				m.view = viewDetail
+				m.message = ""
+			}
 		}
 
 	case "esc", "left", "h", "backspace":
@@ -203,29 +233,95 @@ func (m Model) handleNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.message = dimStyle.Render("Refreshing...")
 		return m, refresh
 
+	case "g":
+		if m.view == viewList {
+			m.grouped = !m.grouped
+			m.cursor = 0
+			m.offset = 0
+			m.applyFilter()
+			if m.grouped {
+				m.message = dimStyle.Render("Grouped by process")
+			} else {
+				m.message = dimStyle.Render("Ungrouped")
+			}
+		}
+
 	case "d", "x":
-		if len(m.filtered) > 0 {
-			entry := m.filtered[m.cursor]
-			if entry.PID > 0 {
+		if m.view == viewList {
+			pid, process := m.selectedPidProcess()
+			if pid > 0 {
+				port := m.selectedPort()
 				m.confirm = true
-				m.message = confirmStyle.Render(fmt.Sprintf("Kill %s (PID %d) on port %d? (y/n)", entry.Process, entry.PID, entry.Port))
+				m.message = confirmStyle.Render(fmt.Sprintf("Kill %s (PID %d) on port %d? (y/n)", process, pid, port))
 			} else {
 				m.message = errorStyle.Render("No PID available — try running with sudo")
 			}
 		}
 
-	case "home", "g":
+	case "home":
 		m.cursor = 0
 		m.message = ""
 
 	case "end", "G":
-		if len(m.filtered) > 0 {
-			m.cursor = len(m.filtered) - 1
-		}
+		m.cursor = m.maxIndex()
 		m.message = ""
 	}
 
 	return m, nil
+}
+
+func (m *Model) selectedPidProcess() (int, string) {
+	if m.grouped {
+		if m.cursor < len(m.rows) {
+			row := m.rows[m.cursor]
+			if row.isGroup {
+				return row.group.pid, row.group.name
+			}
+			return row.entry.PID, row.entry.Process
+		}
+		return 0, ""
+	}
+	if m.cursor < len(m.filtered) {
+		return m.filtered[m.cursor].PID, m.filtered[m.cursor].Process
+	}
+	return 0, ""
+}
+
+func (m *Model) selectedPort() uint16 {
+	if m.grouped {
+		if m.cursor < len(m.rows) {
+			row := m.rows[m.cursor]
+			if row.isGroup && len(row.group.entries) > 0 {
+				return row.group.entries[0].Port
+			}
+			return row.entry.Port
+		}
+		return 0
+	}
+	if m.cursor < len(m.filtered) {
+		return m.filtered[m.cursor].Port
+	}
+	return 0
+}
+
+func (m *Model) selectedEntry() *ports.PortInfo {
+	if m.grouped {
+		if m.cursor < len(m.rows) && !m.rows[m.cursor].isGroup {
+			return &m.rows[m.cursor].entry
+		}
+		return nil
+	}
+	if m.cursor < len(m.filtered) {
+		return &m.filtered[m.cursor]
+	}
+	return nil
+}
+
+func (m *Model) maxIndex() int {
+	if m.grouped {
+		return max(0, len(m.rows)-1)
+	}
+	return max(0, len(m.filtered)-1)
 }
 
 func (m *Model) applyFilter() {
@@ -245,8 +341,76 @@ func (m *Model) applyFilter() {
 		}
 		m.filtered = out
 	}
-	if m.cursor >= len(m.filtered) {
-		m.cursor = max(0, len(m.filtered)-1)
+
+	if m.grouped {
+		m.buildGroups()
+		m.rebuildRows()
+	}
+
+	if m.cursor > m.maxIndex() {
+		m.cursor = m.maxIndex()
+	}
+}
+
+func (m *Model) buildGroups() {
+	groupMap := make(map[string]*processGroup)
+	var order []string
+
+	for _, e := range m.filtered {
+		key := fmt.Sprintf("%s:%d", e.Process, e.PID)
+		if key == ":0" {
+			key = fmt.Sprintf("unknown:%s:%d", e.Address, e.Port)
+		}
+		g, ok := groupMap[key]
+		if !ok {
+			name := e.Process
+			if name == "" {
+				name = fmt.Sprintf("(unknown pid:%d)", e.PID)
+			}
+			g = &processGroup{name: name, pid: e.PID}
+			groupMap[key] = g
+			order = append(order, key)
+		}
+		g.entries = append(g.entries, e)
+		switch e.State {
+		case "LISTEN":
+			g.listening++
+		case "ESTABLISHED":
+			g.established++
+		default:
+			g.other++
+		}
+	}
+
+	m.groups = make([]*processGroup, 0, len(order))
+	for _, key := range order {
+		m.groups = append(m.groups, groupMap[key])
+	}
+
+	// Sort groups: by process name, then by port
+	sort.Slice(m.groups, func(i, j int) bool {
+		if m.groups[i].name != m.groups[j].name {
+			return strings.ToLower(m.groups[i].name) < strings.ToLower(m.groups[j].name)
+		}
+		if len(m.groups[i].entries) > 0 && len(m.groups[j].entries) > 0 {
+			return m.groups[i].entries[0].Port < m.groups[j].entries[0].Port
+		}
+		return false
+	})
+}
+
+func (m *Model) rebuildRows() {
+	m.rows = nil
+	for _, g := range m.groups {
+		m.rows = append(m.rows, listRow{isGroup: true, group: g, expanded: g.expanded})
+		if g.expanded {
+			for _, e := range g.entries {
+				m.rows = append(m.rows, listRow{isGroup: false, entry: e})
+			}
+		}
+	}
+	if m.cursor >= len(m.rows) {
+		m.cursor = max(0, len(m.rows)-1)
 	}
 }
 
@@ -262,6 +426,9 @@ func (m Model) View() string {
 	case viewDetail:
 		return m.renderDetail()
 	default:
+		if m.grouped {
+			return m.renderGrouped()
+		}
 		return m.renderList()
 	}
 }
@@ -269,32 +436,21 @@ func (m Model) View() string {
 func (m Model) renderList() string {
 	var b strings.Builder
 
-	// Title bar
 	title := titleStyle.Render(" port-explorer ")
 	count := dimStyle.Render(fmt.Sprintf(" %d ports", len(m.filtered)))
 	b.WriteString(title + count + "\n\n")
 
-	// Filter bar
 	if m.filtering {
 		b.WriteString(filterPromptStyle.Render("filter: ") + filterInputStyle.Render(m.filter) + "█\n\n")
 	} else if m.filter != "" {
 		b.WriteString(dimStyle.Render(fmt.Sprintf("filter: %s (press / to change, esc to clear)", m.filter)) + "\n\n")
 	}
 
-	// Column header
 	header := dimStyle.Render(fmt.Sprintf("  %-7s %-6s %-8s %-20s %-14s %s", "PORT", "PROTO", "PID", "PROCESS", "STATE", "ADDRESS"))
 	b.WriteString(header + "\n")
 
-	// Calculate visible range
-	listHeight := m.height - 8 // reserve for title, header, footer, etc.
-	if m.filtering || m.filter != "" {
-		listHeight -= 2
-	}
-	if listHeight < 3 {
-		listHeight = 3
-	}
+	listHeight := m.listHeight()
 
-	// Scroll offset
 	if m.cursor < m.offset {
 		m.offset = m.cursor
 	}
@@ -313,20 +469,7 @@ func (m Model) renderList() string {
 
 	for i := m.offset; i < end; i++ {
 		e := m.filtered[i]
-		pidStr := "-"
-		if e.PID > 0 {
-			pidStr = strconv.Itoa(e.PID)
-		}
-		process := e.Process
-		if process == "" {
-			process = "-"
-		}
-
-		state := styleState(e.State)
-
-		line := fmt.Sprintf("%-7d %-6s %-8s %-20s %-14s %s",
-			e.Port, e.Protocol, pidStr, truncate(process, 20), state, e.Address)
-
+		line := formatPortLine(e)
 		if i == m.cursor {
 			b.WriteString(selectedStyle.Render("▸ "+line) + "\n")
 		} else {
@@ -334,25 +477,115 @@ func (m Model) renderList() string {
 		}
 	}
 
-	// Message / status bar
 	b.WriteString("\n")
 	if m.message != "" {
 		b.WriteString(m.message + "\n")
 	}
 
-	// Help bar
-	help := "↑/↓ navigate • enter view details • d kill • / filter • r refresh • q quit"
+	help := "↑/↓ navigate • enter details • d kill • / filter • g group • r refresh • q quit"
+	b.WriteString(helpStyle.Render(help))
+
+	return b.String()
+}
+
+func (m Model) renderGrouped() string {
+	var b strings.Builder
+
+	title := titleStyle.Render(" port-explorer ")
+	groupLabel := dimStyle.Render(fmt.Sprintf(" %d processes, %d ports (grouped)", len(m.groups), len(m.filtered)))
+	b.WriteString(title + groupLabel + "\n\n")
+
+	if m.filtering {
+		b.WriteString(filterPromptStyle.Render("filter: ") + filterInputStyle.Render(m.filter) + "█\n\n")
+	} else if m.filter != "" {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("filter: %s (press / to change, esc to clear)", m.filter)) + "\n\n")
+	}
+
+	listHeight := m.listHeight()
+
+	if m.cursor < m.offset {
+		m.offset = m.cursor
+	}
+	if m.cursor >= m.offset+listHeight {
+		m.offset = m.cursor - listHeight + 1
+	}
+
+	end := m.offset + listHeight
+	if end > len(m.rows) {
+		end = len(m.rows)
+	}
+
+	if len(m.rows) == 0 {
+		b.WriteString(dimStyle.Render("\n  No matching ports found.") + "\n")
+	}
+
+	for i := m.offset; i < end; i++ {
+		row := m.rows[i]
+		if row.isGroup {
+			g := row.group
+			arrow := "▶"
+			if g.expanded {
+				arrow = "▼"
+			}
+
+			// Build stats summary
+			var stats []string
+			stats = append(stats, fmt.Sprintf("%d ports", len(g.entries)))
+			if g.listening > 0 {
+				stats = append(stats, listenStyle.Render(fmt.Sprintf("%d listen", g.listening)))
+			}
+			if g.established > 0 {
+				stats = append(stats, estabStyle.Render(fmt.Sprintf("%d estab", g.established)))
+			}
+			if g.other > 0 {
+				stats = append(stats, dimStyle.Render(fmt.Sprintf("%d other", g.other)))
+			}
+
+			pidStr := ""
+			if g.pid > 0 {
+				pidStr = dimStyle.Render(fmt.Sprintf(" (PID %d)", g.pid))
+			}
+
+			line := fmt.Sprintf("%s %s%s  %s",
+				arrow,
+				groupHeaderStyle.Render(g.name),
+				pidStr,
+				groupCountStyle.Render(strings.Join(stats, ", ")))
+
+			if i == m.cursor {
+				b.WriteString(selectedStyle.Render(line) + "\n")
+			} else {
+				b.WriteString(line + "\n")
+			}
+		} else {
+			e := row.entry
+			line := fmt.Sprintf("    %-7d %-6s %-14s %s",
+				e.Port, e.Protocol, styleState(e.State), e.Address)
+			if i == m.cursor {
+				b.WriteString(selectedStyle.Render("  ▸"+line) + "\n")
+			} else {
+				b.WriteString(dimStyle.Render("   ")+normalStyle.Render(line) + "\n")
+			}
+		}
+	}
+
+	b.WriteString("\n")
+	if m.message != "" {
+		b.WriteString(m.message + "\n")
+	}
+
+	help := "↑/↓ navigate • enter expand/details • d kill • / filter • g ungroup • r refresh • q quit"
 	b.WriteString(helpStyle.Render(help))
 
 	return b.String()
 }
 
 func (m Model) renderDetail() string {
-	if m.cursor >= len(m.filtered) {
+	e := m.selectedEntry()
+	if e == nil {
 		return "No selection"
 	}
 
-	e := m.filtered[m.cursor]
 	var b strings.Builder
 
 	title := titleStyle.Render(fmt.Sprintf(" Port %d — Details ", e.Port))
@@ -381,7 +614,6 @@ func (m Model) renderDetail() string {
 	}
 	writeDetail("Process", process)
 
-	// Show other connections from the same process
 	if e.PID > 0 {
 		b.WriteString("\n")
 		b.WriteString(detailLabelStyle.Render("  Other ports by this process:") + "\n")
@@ -400,7 +632,6 @@ func (m Model) renderDetail() string {
 		}
 	}
 
-	// Process details from /proc if available
 	if e.PID > 0 {
 		b.WriteString("\n")
 		cmdline := readProcFile(e.PID, "cmdline")
@@ -428,6 +659,31 @@ func (m Model) renderDetail() string {
 	return b.String()
 }
 
+func (m Model) listHeight() int {
+	h := m.height - 8
+	if m.filtering || m.filter != "" {
+		h -= 2
+	}
+	if h < 3 {
+		h = 3
+	}
+	return h
+}
+
+func formatPortLine(e ports.PortInfo) string {
+	pidStr := "-"
+	if e.PID > 0 {
+		pidStr = strconv.Itoa(e.PID)
+	}
+	process := e.Process
+	if process == "" {
+		process = "-"
+	}
+	state := styleState(e.State)
+	return fmt.Sprintf("%-7d %-6s %-8s %-20s %-14s %s",
+		e.Port, e.Protocol, pidStr, truncate(process, 20), state, e.Address)
+}
+
 func styleState(state string) string {
 	switch state {
 	case "LISTEN":
@@ -453,7 +709,6 @@ func readProcFile(pid int, name string) string {
 	if err != nil {
 		return ""
 	}
-	// cmdline uses null bytes as separators
 	s := strings.ReplaceAll(string(data), "\x00", " ")
 	return strings.TrimSpace(s)
 }
