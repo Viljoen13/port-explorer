@@ -1,0 +1,17 @@
+# Binary
+port-explorer
+port-explorer.exe
+
+# Go
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
