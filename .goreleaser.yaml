@@ -1,0 +1,44 @@
+version: 2
+
+project_name: port-explorer
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: port-explorer
+    main: .
+    binary: port-explorer
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X github.com/Viljoen13/port-explorer/cmd.version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files: [LICENSE, README.md]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^test:", "^chore:"]
+
+release:
+  draft: false
+  footer: |
+    ## Install
+
+    ```sh
+    go install github.com/Viljoen13/port-explorer@{{ .Tag }}
+    ```
+    Or grab a binary above, `chmod +x` it and drop it on your PATH.

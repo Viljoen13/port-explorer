@@ -1,158 +1,208 @@
+// Package cmd wires up the command-line interface.
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Viljoen13/port-explorer/internal/display"
 	"github.com/Viljoen13/port-explorer/internal/ports"
+	"github.com/Viljoen13/port-explorer/internal/theme"
 	"github.com/Viljoen13/port-explorer/internal/tui"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 	"github.com/spf13/cobra"
 )
 
+// version is overridden at build time via -ldflags "-X .../cmd.version=v1.2.3".
+var version = "dev"
+
 var (
-	flagProcess string
-	flagJSON    bool
-	flagAll     bool
-	flagList    bool
+	flagProcess     string
+	flagJSON        bool
+	flagAll         bool
+	flagList        bool
+	flagInteractive bool
+	flagOutput      string
+	flagSort        string
+	flagDesc        bool
+	flagWide        bool
+	flagNoColor     bool
+	flagQuiet       bool
+	flagRefresh     time.Duration
 )
 
+// errNoMatch signals "ran fine, found nothing" so scripts get exit code 1
+// without an error banner.
+var errNoMatch = errors.New("no matching ports")
+
 var rootCmd = &cobra.Command{
-	Use:   "port-explorer [port or range]",
+	Use:   "port-explorer [filter...]",
 	Short: "See what's running on your ports",
-	Long:  "A friendly, cross-platform tool to inspect network ports, processes, and connections.\n\nRun without flags for an interactive TUI. Use --list or --json for non-interactive output.",
-	Args:  cobra.MaximumNArgs(1),
-	RunE:  runRoot,
+	Long: `port-explorer shows which processes hold which ports, on Linux, macOS and Windows.
+
+Run it with no arguments for an interactive dashboard. Give it a filter for a
+quick answer in the terminal:
+
+  port-explorer 8080            what's on port 8080?
+  port-explorer 3000-4000       anything in this range?
+  port-explorer nginx           ports held by nginx
+  port-explorer exposed         listening on a public interface
+  port-explorer docker          ports belonging to containers
+  port-explorer --all estab     every established connection
+
+Filter language (terms are ANDed, prefix ! to negate):
+  8080  :8080  3000-4000  >1024  <=443  tcp  udp  listen  estab
+  exposed  local  docker  unknown  pid:123  user:root  proc:node
+  svc:http  addr:127.0.0.1  remote:443  any-free-text
+
+Exit status is 1 when a filter matches nothing, so it works in scripts:
+  port-explorer -q 8080 && echo "port 8080 is busy"`,
+	Example: `  port-explorer
+  port-explorer 5432
+  port-explorer -o json listen
+  port-explorer -i exposed
+  port-explorer kill 3000
+  port-explorer free 3000
+  port-explorer wait 8080 --timeout 30s`,
+	Args:          cobra.ArbitraryArgs,
+	Version:       version,
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE:          runRoot,
 }
 
+// Execute runs the CLI and exits with an appropriate status.
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
-		os.Exit(1)
+		if errors.Is(err, errNoMatch) {
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stderr, theme.Error.Render("error:"), err)
+		os.Exit(2)
 	}
 }
 
 func init() {
-	rootCmd.Flags().StringVarP(&flagProcess, "process", "p", "", "filter by process name (substring match)")
-	rootCmd.Flags().BoolVarP(&flagJSON, "json", "j", false, "output as JSON (non-interactive)")
-	rootCmd.Flags().BoolVarP(&flagAll, "all", "a", false, "show all connections, not just listening")
-	rootCmd.Flags().BoolVarP(&flagList, "list", "l", false, "non-interactive table output")
+	f := rootCmd.Flags()
+	f.StringVarP(&flagProcess, "process", "p", "", "filter by process name (shorthand for proc:NAME)")
+	f.BoolVarP(&flagAll, "all", "a", false, "include established and other non-listening sockets")
+	f.BoolVarP(&flagList, "list", "l", false, "print a table instead of opening the dashboard")
+	f.BoolVarP(&flagInteractive, "interactive", "i", false, "open the dashboard even when a filter is given")
+	f.BoolVarP(&flagJSON, "json", "j", false, "shorthand for --output json")
+	f.StringVarP(&flagOutput, "output", "o", "table", "output format: table, json, csv, plain")
+	f.StringVarP(&flagSort, "sort", "s", "port", "sort by: port, process, pid, state, user")
+	f.BoolVar(&flagDesc, "desc", false, "sort descending")
+	f.BoolVarP(&flagWide, "wide", "w", false, "show user, uptime and full command line")
+	f.BoolVar(&flagNoColor, "no-color", false, "disable colours (also honours NO_COLOR)")
+	f.BoolVarP(&flagQuiet, "quiet", "q", false, "print nothing; only set the exit status")
+	f.DurationVar(&flagRefresh, "refresh", 2*time.Second, "auto-refresh interval for live mode in the dashboard")
+
+	rootCmd.PersistentPreRun = func(*cobra.Command, []string) {
+		if flagNoColor || os.Getenv("NO_COLOR") != "" {
+			lipgloss.SetColorProfile(termenv.Ascii)
+		}
+	}
+	rootCmd.SetVersionTemplate("port-explorer {{.Version}}\n")
+}
+
+func buildQuery(args []string) string {
+	terms := append([]string{}, args...)
+	if flagProcess != "" {
+		terms = append(terms, "proc:"+flagProcess)
+	}
+	return strings.Join(terms, " ")
 }
 
 func runRoot(cmd *cobra.Command, args []string) error {
-	// Launch interactive TUI if no non-interactive flags are set
-	if !flagJSON && !flagList && len(args) == 0 && flagProcess == "" {
-		return tui.Run()
+	query := buildQuery(args)
+	nonInteractive := flagList || flagJSON || flagQuiet || cmd.Flags().Changed("output") || query != ""
+	if flagInteractive || !nonInteractive {
+		return tui.Run(tui.Options{Query: query, ShowAll: flagAll, Refresh: flagRefresh})
 	}
-
-	return runList(args)
+	return runList(query)
 }
 
-func runList(args []string) error {
+func runList(query string) error {
+	if flagJSON {
+		flagOutput = "json"
+	}
+	sortField, err := parseSortField(flagSort)
+	if err != nil {
+		return err
+	}
+
 	entries, err := ports.List()
 	if err != nil {
 		return fmt.Errorf("listing ports: %w", err)
 	}
-
-	// Filter by listening only (default unless --all)
+	entries = ports.Merge(entries)
 	if !flagAll {
-		entries = filterState(entries, "LISTEN")
+		entries = ports.Listening(entries)
+	}
+	q := ports.ParseQuery(query)
+	entries = q.Filter(entries)
+	ports.Sort(entries, sortField, !flagDesc)
+
+	if flagQuiet {
+		if len(entries) == 0 {
+			return errNoMatch
+		}
+		return nil
 	}
 
-	// Filter by port or port range
-	if len(args) == 1 {
-		entries, err = filterByPort(entries, args[0])
-		if err != nil {
+	switch flagOutput {
+	case "json":
+		if err := display.PrintJSON(os.Stdout, entries); err != nil {
 			return err
 		}
+	case "csv":
+		if err := display.PrintCSV(os.Stdout, entries); err != nil {
+			return err
+		}
+	case "plain":
+		display.PrintPlain(os.Stdout, entries)
+	case "table":
+		if len(entries) == 0 {
+			printNothingFound(q)
+		} else {
+			display.PrintTable(os.Stdout, entries, display.Options{ShowRemote: flagAll, Wide: flagWide})
+			fmt.Println()
+			fmt.Println(display.Summary(entries, ports.IsPrivileged()))
+		}
+	default:
+		return fmt.Errorf("unknown output format %q (want table, json, csv or plain)", flagOutput)
 	}
 
-	// Filter by process name
-	if flagProcess != "" {
-		entries = filterByProcess(entries, flagProcess)
+	if len(entries) == 0 && !q.Empty() {
+		return errNoMatch
 	}
-
-	// Deduplicate: same port+proto+pid shown once (IPv4 and IPv6 both show up)
-	entries = dedup(entries)
-
-	if flagJSON {
-		return display.PrintJSON(os.Stdout, entries)
-	}
-
-	display.PrintTable(os.Stdout, entries)
-	fmt.Println(display.FormatSummary(entries))
 	return nil
 }
 
-func filterState(entries []ports.PortInfo, state string) []ports.PortInfo {
-	var out []ports.PortInfo
-	for _, e := range entries {
-		if e.State == state {
-			out = append(out, e)
-		}
+func printNothingFound(q ports.Query) {
+	if port, ok := q.ExactPort(); ok {
+		fmt.Printf("%s Nothing is listening on port %d — it's free.\n", theme.Success.Render("✓"), port)
+		return
 	}
-	return out
+	if q.Empty() {
+		fmt.Println(theme.Muted.Render("No sockets found."))
+		return
+	}
+	fmt.Printf("%s\n", theme.Muted.Render(fmt.Sprintf("No ports match %q.", q.String())))
+	if !flagAll {
+		fmt.Println(theme.Muted.Render("  Only listening sockets are shown; add --all to include established connections."))
+	}
 }
 
-func filterByPort(entries []ports.PortInfo, spec string) ([]ports.PortInfo, error) {
-	if strings.Contains(spec, "-") {
-		parts := strings.SplitN(spec, "-", 2)
-		low, err := strconv.ParseUint(parts[0], 10, 16)
-		if err != nil {
-			return nil, fmt.Errorf("invalid port range start: %s", parts[0])
-		}
-		high, err := strconv.ParseUint(parts[1], 10, 16)
-		if err != nil {
-			return nil, fmt.Errorf("invalid port range end: %s", parts[1])
-		}
-		var out []ports.PortInfo
-		for _, e := range entries {
-			if uint64(e.Port) >= low && uint64(e.Port) <= high {
-				out = append(out, e)
-			}
-		}
-		return out, nil
-	}
-
-	port, err := strconv.ParseUint(spec, 10, 16)
-	if err != nil {
-		return nil, fmt.Errorf("invalid port: %s", spec)
-	}
-	var out []ports.PortInfo
-	for _, e := range entries {
-		if uint64(e.Port) == port {
-			out = append(out, e)
+func parseSortField(s string) (ports.SortField, error) {
+	for _, f := range ports.SortFields {
+		if string(f) == strings.ToLower(s) {
+			return f, nil
 		}
 	}
-	return out, nil
-}
-
-func filterByProcess(entries []ports.PortInfo, name string) []ports.PortInfo {
-	name = strings.ToLower(name)
-	var out []ports.PortInfo
-	for _, e := range entries {
-		if strings.Contains(strings.ToLower(e.Process), name) {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
-func dedup(entries []ports.PortInfo) []ports.PortInfo {
-	type key struct {
-		port  uint16
-		proto string
-		pid   int
-	}
-	seen := make(map[key]bool)
-	var out []ports.PortInfo
-	for _, e := range entries {
-		k := key{e.Port, e.Protocol, e.PID}
-		if !seen[k] {
-			seen[k] = true
-			out = append(out, e)
-		}
-	}
-	return out
+	return "", fmt.Errorf("unknown sort field %q (want port, process, pid, state or user)", s)
 }

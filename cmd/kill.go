@@ -6,90 +6,160 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
+	"time"
 
 	"github.com/Viljoen13/port-explorer/internal/ports"
+	"github.com/Viljoen13/port-explorer/internal/theme"
 	"github.com/spf13/cobra"
 )
 
 var (
 	flagForce bool
 	flagYes   bool
+	flagByPID bool
 )
 
 var killCmd = &cobra.Command{
-	Use:   "kill <port>",
-	Short: "Kill the process running on a given port",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runKill,
+	Use:   "kill <port|pid>...",
+	Short: "Stop the process holding a port",
+	Long: `Stop the process that owns a port. By default the process receives a polite
+termination request; use --force to kill it outright.
+
+Targets are ports. Pass --pid to treat them as process IDs instead.`,
+	Example: `  port-explorer kill 3000
+  port-explorer kill 3000 3001 --yes
+  port-explorer kill 8080 --force
+  port-explorer kill --pid 41234`,
+	Args: cobra.MinimumNArgs(1),
+	RunE: runKill,
 }
 
 func init() {
-	killCmd.Flags().BoolVarP(&flagForce, "force", "f", false, "send SIGKILL instead of SIGTERM")
-	killCmd.Flags().BoolVarP(&flagYes, "yes", "y", false, "skip confirmation prompt")
+	killCmd.Flags().BoolVarP(&flagForce, "force", "f", false, "kill immediately (SIGKILL) instead of asking nicely (SIGTERM)")
+	killCmd.Flags().BoolVarP(&flagYes, "yes", "y", false, "do not ask for confirmation")
+	killCmd.Flags().BoolVar(&flagByPID, "pid", false, "treat arguments as process IDs rather than ports")
 	rootCmd.AddCommand(killCmd)
 }
 
 func runKill(cmd *cobra.Command, args []string) error {
-	port, err := strconv.ParseUint(args[0], 10, 16)
-	if err != nil {
-		return fmt.Errorf("invalid port: %s", args[0])
-	}
-
 	entries, err := ports.List()
 	if err != nil {
 		return fmt.Errorf("listing ports: %w", err)
 	}
 
-	// Find processes on this port
-	var matches []ports.PortInfo
-	for _, e := range entries {
-		if uint64(e.Port) == port && e.PID > 0 {
-			matches = append(matches, e)
-		}
+	type target struct {
+		pid     int
+		process string
+		port    uint16
 	}
+	var targets []target
+	seen := map[int]bool{}
+	self := os.Getpid()
 
-	if len(matches) == 0 {
-		return fmt.Errorf("no process found on port %d", port)
-	}
-
-	// Deduplicate by PID
-	seen := make(map[int]bool)
-	var unique []ports.PortInfo
-	for _, m := range matches {
-		if !seen[m.PID] {
-			seen[m.PID] = true
-			unique = append(unique, m)
+	for _, arg := range args {
+		n, err := strconv.Atoi(strings.TrimPrefix(arg, ":"))
+		if err != nil || n <= 0 {
+			return fmt.Errorf("invalid target %q: want a port number or PID", arg)
 		}
-	}
-
-	for _, m := range unique {
-		sig := "SIGTERM"
-		if flagForce {
-			sig = "SIGKILL"
+		if flagByPID {
+			name := ""
+			for _, e := range entries {
+				if e.PID == n {
+					name = e.Process
+					break
+				}
+			}
+			if !seen[n] {
+				seen[n] = true
+				targets = append(targets, target{pid: n, process: name})
+			}
+			continue
 		}
-
-		if !flagYes {
-			fmt.Printf("Kill process %q (PID %d) on port %d with %s? [y/N] ", m.Process, m.PID, m.Port, sig)
-			reader := bufio.NewReader(os.Stdin)
-			answer, _ := reader.ReadString('\n')
-			answer = strings.TrimSpace(strings.ToLower(answer))
-			if answer != "y" && answer != "yes" {
-				fmt.Println("Skipped.")
+		found := false
+		hidden := 0
+		for _, e := range entries {
+			if int(e.Port) != n {
 				continue
 			}
+			found = true
+			if e.PID == 0 {
+				hidden++
+				continue
+			}
+			if !seen[e.PID] {
+				seen[e.PID] = true
+				targets = append(targets, target{pid: e.PID, process: e.Process, port: e.Port})
+			}
 		}
-
-		signal := syscall.SIGTERM
-		if flagForce {
-			signal = syscall.SIGKILL
+		switch {
+		case !found:
+			return fmt.Errorf("nothing is using port %d", n)
+		case len(targets) == 0 && hidden > 0:
+			return fmt.Errorf("port %d is in use but its owner is hidden — rerun with sudo", n)
 		}
-
-		if err := syscall.Kill(m.PID, signal); err != nil {
-			return fmt.Errorf("killing PID %d: %w", m.PID, err)
-		}
-		fmt.Printf("Sent %s to %q (PID %d)\n", sig, m.Process, m.PID)
 	}
 
+	for _, t := range targets {
+		if t.pid == self {
+			fmt.Println(theme.Warning.Render("Refusing to kill port-explorer itself."))
+			continue
+		}
+		label := describe(t.process, t.pid, t.port)
+		if !flagYes && !confirmPrompt(fmt.Sprintf("Send %s to %s?", ports.SignalName(flagForce), label)) {
+			fmt.Println(theme.Muted.Render("Skipped."))
+			continue
+		}
+		if err := ports.Kill(t.pid, flagForce); err != nil {
+			return err
+		}
+		fmt.Printf("%s Sent %s to %s\n", theme.Success.Render("✓"), ports.SignalName(flagForce), label)
+		if !flagForce {
+			if stillAlive(t.pid, 1500*time.Millisecond) {
+				fmt.Println(theme.Warning.Render("  still running after 1.5s — use --force if it refuses to exit"))
+			}
+		}
+	}
 	return nil
+}
+
+func describe(process string, pid int, port uint16) string {
+	name := process
+	if name == "" {
+		name = "process"
+	}
+	s := fmt.Sprintf("%s (PID %d)", theme.Bold.Render(name), pid)
+	if port > 0 {
+		s += fmt.Sprintf(" on port %d", port)
+	}
+	return s
+}
+
+func confirmPrompt(question string) bool {
+	fmt.Printf("%s [y/N] ", question)
+	answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	answer = strings.TrimSpace(strings.ToLower(answer))
+	return answer == "y" || answer == "yes"
+}
+
+// stillAlive polls the port table until the PID disappears or the deadline passes.
+func stillAlive(pid int, wait time.Duration) bool {
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		time.Sleep(250 * time.Millisecond)
+		entries, err := ports.List()
+		if err != nil {
+			return false
+		}
+		alive := false
+		for _, e := range entries {
+			if e.PID == pid {
+				alive = true
+				break
+			}
+		}
+		if !alive {
+			return false
+		}
+	}
+	return true
 }
