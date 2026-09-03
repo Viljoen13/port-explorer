@@ -45,7 +45,11 @@ func key(s string) tea.KeyMsg {
 
 func loaded(t *testing.T, opts Options) Model {
 	t.Helper()
-	var m tea.Model = New(opts)
+	base := New(opts)
+	// New() probes the real shell, so the sudo hints these tests assert on
+	// disappear when the suite runs elevated (root, or a Windows CI runner).
+	base.privileged = false
+	var m tea.Model = base
 	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m, _ = m.Update(refreshMsg{entries: fixtures(), at: time.Now()})
 	return m.(Model)
